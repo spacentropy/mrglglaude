@@ -29,6 +29,9 @@ plutil -insert RunAtLoad -bool YES "$PLIST"
 plutil -insert KeepAlive -bool YES "$PLIST"
 plutil -insert StandardOutPath -string "$PWD/bridge.log" "$PLIST"
 plutil -insert StandardErrorPath -string "$PWD/bridge.log" "$PLIST"
+# Hex: collect garbage every 1 MB instead of the default 8 MB, which the bridge would otherwise keep resident.
+plutil -insert EnvironmentVariables -dictionary "$PLIST"
+plutil -insert EnvironmentVariables.DOTNET_GCgen0size -string 100000 "$PLIST"
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 pkill -f 'bin/ClaudeForeverBridge' || true # a copy started by hand from a terminal

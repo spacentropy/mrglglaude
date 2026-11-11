@@ -19,6 +19,8 @@ const int Slots = 1000, PeriodSeconds = 10, TickMilliseconds = 2000, IdleTickMil
 
 var claude = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
 var transcripts = new Dictionary<string, TranscriptTail>();
+var listings = new Dictionary<string, (DateTime Modified, string[] Entries)>();
+var sessionFiles = new Dictionary<string, SessionFile>();
 
 if (args.Contains("--selftest"))
 {
@@ -164,22 +166,44 @@ static Transcript ApplyLine(Transcript state, ReadOnlyMemory<byte> line)
 // Transcripts are append-only, so each read continues from where the previous one stopped.
 static TranscriptTail ReadTranscript(TranscriptTail tail)
 {
+    if (new FileInfo(tail.Path).Length == tail.Offset)
+        return tail; // nothing appended: a stat is several times cheaper than opening the file
     using var stream = File.OpenRead(tail.Path);
     var length = stream.Length;
     if (length < tail.Offset)
         tail = new TranscriptTail(tail.Path, 0, Transcript.Empty);
     stream.Seek(tail.Offset, SeekOrigin.Begin);
-    var bytes = new byte[length - tail.Offset];
-    stream.ReadExactly(bytes);
-    var end = Array.LastIndexOf(bytes, (byte)'\n') + 1; // a line still being written is read next time
-    var state = tail.State;
-    for (var start = 0; start < end;)
+    // Read in pieces: one array for a transcript of many megabytes stays in the process's memory for good.
+    var bytes = new byte[Math.Min(length - tail.Offset, 1 << 16)];
+    var (offset, state, filled) = (tail.Offset, tail.State, 0);
+    for (int read; (read = stream.Read(bytes, filled, bytes.Length - filled)) > 0;)
     {
-        var newline = Array.IndexOf(bytes, (byte)'\n', start);
-        state = ApplyLine(state, bytes.AsMemory(start, newline - start));
-        start = newline + 1;
+        filled += read;
+        var end = Array.LastIndexOf(bytes, (byte)'\n', filled - 1) + 1; // a line still being written is read next time
+        for (var start = 0; start < end;)
+        {
+            var newline = Array.IndexOf(bytes, (byte)'\n', start);
+            state = ApplyLine(state, bytes.AsMemory(start, newline - start));
+            start = newline + 1;
+        }
+        (offset, filled) = (offset + end, filled - end);
+        Array.Copy(bytes, end, bytes, 0, filled);
+        if (filled == bytes.Length)
+            Array.Resize(ref bytes, filled * 2); // a line longer than the buffer
     }
-    return tail with { Offset = tail.Offset + end, State = state };
+    return tail with { Offset = offset, State = state };
+}
+
+// Every tick lists the same directories and reads the same session files, and opening either costs several stats,
+// so both are reread only when their mtime moves (for a directory: an entry was added or removed).
+// shortcut: trusts mtime (nanoseconds on APFS); a filesystem with coarse timestamps can hide a change until the next one, so reread every tick there.
+string[] Entries(string name, string pattern)
+{
+    var directory = Path.Combine(claude, name);
+    var modified = Directory.GetLastWriteTimeUtc(directory);
+    if (!listings.TryGetValue(directory, out var listing) || listing.Modified != modified)
+        listings[directory] = listing = (modified, Directory.GetFileSystemEntries(directory, pattern));
+    return listing.Entries;
 }
 
 Transcript TranscriptState(string sessionId)
@@ -187,7 +211,7 @@ Transcript TranscriptState(string sessionId)
     if (!transcripts.TryGetValue(sessionId, out var tail) || !File.Exists(tail.Path))
     {
         var file = sessionId + ".jsonl";
-        var path = Directory.EnumerateDirectories(Path.Combine(claude, "projects"))
+        var path = Entries("projects", "*") // a session with no transcript yet is looked up on every tick
             .Select(project => Path.Combine(project, file))
             .FirstOrDefault(File.Exists);
         if (path is null)
@@ -214,18 +238,23 @@ static bool IsAlive(int pid)
 List<Session> ReadSessions()
 {
     var sessions = new List<Session>();
-    foreach (var path in Directory.EnumerateFiles(Path.Combine(claude, "sessions"), "*.json"))
+    foreach (var path in Entries("sessions", "*.json"))
     {
         try
         {
-            using var document = JsonDocument.Parse(File.ReadAllText(path));
-            var session = document.RootElement;
-            if (!IsAlive(Get(session, "pid").GetInt32()))
+            var modified = File.GetLastWriteTimeUtc(path);
+            if (!sessionFiles.TryGetValue(path, out var file) || file.Modified != modified)
+            {
+                using var document = JsonDocument.Parse(File.ReadAllBytes(path));
+                var session = document.RootElement;
+                var changed = Get(session, "statusUpdatedAt") is { ValueKind: JsonValueKind.Number } updated ? updated : Get(session, "startedAt");
+                sessionFiles[path] = file = new SessionFile(modified, Get(session, "pid").GetInt32(), Text(session, "sessionId") ?? throw new InvalidOperationException(),
+                    Text(session, "name") ?? "?", Text(session, "status") ?? "unknown", changed.GetInt64() / 1000);
+            }
+            if (!IsAlive(file.Pid))
                 continue;
-            var transcript = TranscriptState(Text(session, "sessionId") ?? throw new InvalidOperationException());
-            var changed = Get(session, "statusUpdatedAt") is { ValueKind: JsonValueKind.Number } updated ? updated : Get(session, "startedAt");
-            sessions.Add(new Session(Text(session, "name") ?? "?", transcript.Title, Text(session, "status") ?? "unknown",
-                transcript.Activity, transcript.Actions, changed.GetInt64() / 1000));
+            var transcript = TranscriptState(file.SessionId);
+            sessions.Add(new Session(file.Name, transcript.Title, file.Status, transcript.Activity, transcript.Actions, file.Since));
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException or FormatException)
         {
@@ -265,7 +294,7 @@ void WriteSlot(int index, string feed)
     File.Move(partial, target, overwrite: true);
 }
 
-static void SelfTest()
+void SelfTest()
 {
     static void Check(bool condition, string what)
     {
@@ -294,16 +323,40 @@ static void SelfTest()
         Check(tail.State.Title == "Fix login", "title");
         Check(tail.State.Actions == 2, "actions reset on a real prompt only");
         Check(tail.State.Activity == "Bash", "Bash command text stays hidden");
+        Check(ReferenceEquals(ReadTranscript(tail), tail), "an unchanged transcript is not reread");
 
         File.AppendAllText(path, """{"type":"user","message":{"content":"thi""");
         var partial = ReadTranscript(tail);
         Check(partial.Offset == tail.Offset && partial.State.Actions == 2, "a line still being written is left for later");
         File.AppendAllText(path, "rd\"}}\n");
-        Check(ReadTranscript(partial).State is { Actions: 0, Title: "Fix login" }, "reading continues from the offset");
+        var resumed = ReadTranscript(partial);
+        Check(resumed.State is { Actions: 0, Title: "Fix login" }, "reading continues from the offset");
+        File.AppendAllText(path, Entry("assistant", Tool("Edit", $$"""{"description":"{{new string('x', 200_000)}}"}""")) + "\n" + Entry("assistant", Tool("Read", "{}")) + "\n");
+        Check(ReadTranscript(resumed).State is { Actions: 2, Activity: "Read" }, "a line longer than the read buffer is kept whole");
     }
     finally
     {
         File.Delete(path);
+    }
+
+    // ReadSessions against a scratch ~/.claude: both mtime caches must notice a change made right after a read.
+    claude = Directory.CreateTempSubdirectory().FullName;
+    try
+    {
+        var projects = Directory.CreateDirectory(Path.Combine(claude, "projects")).FullName;
+        var session = Path.Combine(Directory.CreateDirectory(Path.Combine(claude, "sessions")).FullName, "1.json");
+        string Rows(string status)
+        {
+            File.WriteAllText(session, $$"""{"pid":{{Environment.ProcessId}},"sessionId":"s","status":"{{status}}","startedAt":0}""");
+            return RenderRows(ReadSessions());
+        }
+        Check(Rows("busy").Contains("status=\"busy\",activity=\"\""), "a session without a transcript is listed");
+        File.WriteAllLines(Path.Combine(Directory.CreateDirectory(Path.Combine(projects, "p")).FullName, "s.jsonl"), [Entry("assistant", Tool("Read", "{}"))]);
+        Check(Rows("idle").Contains("status=\"idle\",activity=\"Read\""), "a rewritten session file and a new project are picked up");
+    }
+    finally
+    {
+        Directory.Delete(claude, recursive: true);
     }
 
     Check(SlotAt(0) == 1 && SlotAt(PeriodSeconds - 1) == 1 && SlotAt(PeriodSeconds) == 2, "slot follows the period");
@@ -318,4 +371,5 @@ record Transcript(string Title, int Actions, string Activity)
     public static readonly Transcript Empty = new("", 0, "");
 }
 record TranscriptTail(string Path, long Offset, Transcript State);
+record SessionFile(DateTime Modified, int Pid, string SessionId, string Name, string Status, long Since);
 record Session(string Name, string Title, string Status, string Activity, int Actions, long Since);
