@@ -1,5 +1,6 @@
 ## Interface: 16001
 ## Title: Claude Forever
 ## Notes: Shows what your Claude Code sessions are doing. Needs ClaudeForeverBridge running.
+## IconTexture: Interface\AddOns\ClaudeForever\icon
 
 ClaudeForever.lua
